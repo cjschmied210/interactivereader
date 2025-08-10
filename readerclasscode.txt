@@ -1,0 +1,693 @@
+import React, { useState, useEffect, useMemo, useCallback, createContext, useContext } from 'react';
+import { initializeApp } from 'firebase/app';
+import { 
+    getAuth, 
+    onAuthStateChanged, 
+    signOut,
+    signInAnonymously,
+    signInWithCustomToken
+} from 'firebase/auth';
+import { 
+    getFirestore, 
+    doc, 
+    setDoc, 
+    getDoc, 
+    addDoc, 
+    collection, 
+    query, 
+    where, 
+    onSnapshot,
+    getDocs,
+    serverTimestamp,
+    updateDoc,
+    deleteDoc,
+    runTransaction,
+    arrayUnion
+} from 'firebase/firestore';
+
+// --- Configuration & Content ---
+// This section contains all the configurable text, story content, and game-like elements.
+const AppConfig = {
+    storyTitle: "The Weight of Whispers",
+    storyAuthor: "by AI Historian",
+    storyText: [
+        "The old city of Veridia was built on secrets, its cobblestone streets paved with stories untold and its marble statues guardians of legacies long forgotten. Elara, a young archivist, felt the weight of these whispers every day in the Grand Library, a place where silence spoke volumes.",
+        "One rainy afternoon, while cataloging a collection of dusty, leather-bound journals, she found one that was different. It had no title, no author, just a single, embossed symbol on its cover: a serpent eating its own tail. Her heart quickened. This was the Ouroboros, the sigil of the city's disgraced founder, Alistair.",
+        "The journal's pages were filled with cryptic entries, not of city management, but of celestial alignments, arcane rituals, and a 'Heart of Veridia.' It spoke of a hidden chamber beneath the library, where the city's life force was supposedly contained. Alistair hadn't been a traitor, as history claimed; he was a protector.",
+        "Driven by a thirst for truth, Elara followed the journal's clues. She navigated secret passages behind moving bookshelves and solved riddles etched into the stone. The final clue led her to the library's main rotunda, to a specific floor tile under the great dome.",
+        "With trembling hands, she lifted the stone. A spiral staircase descended into darkness. As she stepped down, the air grew thick with energy, and a faint, blue light pulsed from below. She had found the Heart of Veridia, and with it, the city's greatest secret. Now, she faced a choice: reveal the truth and shatter the city's foundations, or become the new guardian of the whispers."
+    ],
+    anticipationGuideStatements: [
+        "History is always an accurate account of the past.",
+        "It is better to protect a comfortable lie than to reveal a painful truth.",
+        "Some secrets should remain buried forever."
+    ],
+    vocabulary: {
+        "archivist": "A person who is in charge of archives, which are collections of historical documents or records.",
+        "sigil": "An inscribed or painted symbol considered to have magical power.",
+        "arcane": "Understood by few; mysterious or secret.",
+        "rotunda": "A round building or room, especially one with a dome."
+    },
+    XP_VALUES: { READ: 10, ANNOTATE: 25, ANNOTATE_WORLD: 5, REPLY: 15 },
+    LEVELS: [0, 100, 250, 500, 1000, 2000],
+    BADGES: {
+        firstSteps: { name: "First Steps", icon: "👟", desc: "Completed your first reading." },
+        scholar: { name: "Scholar", icon: "📚", desc: "Made 10 annotations." },
+        commentator: { name: "Commentator", icon: "💬", desc: "Replied to 5 peers." },
+        deepThinker: { name: "Deep Thinker", icon: "🌍", desc: "Made 5 'Text-to-World' connections." },
+    },
+    PROFANITY_LIST: ['darn', 'heck', 'gosh', 'jerk', 'butt', 'fart', 'stupid', 'dumb', 'idiot', 'crap', 'poop', 'suck', 'hell', 'damn', 'bitch', 'asshole', 'fuck', 'shit', 'cunt', 'nigger', 'faggot', 'fag', 'dyke', 'tranny'],
+};
+
+
+// --- Context for Global State ---
+const AppContext = createContext(null);
+
+// --- Main App Component ---
+export default function App() {
+    // --- State Management ---
+    const [auth, setAuth] = useState(null);
+    const [db, setDb] = useState(null);
+    const [user, setUser] = useState(null);
+    const [userData, setUserData] = useState(null);
+    const [isLoading, setIsLoading] = useState(true);
+    const [error, setError] = useState('');
+    const [currentView, setCurrentView] = useState('loading'); // loading, profileCreation, studentDashboard, teacherDashboard, reader, classRoster
+    const [currentClass, setCurrentClass] = useState(null);
+    
+    const firebaseConfig = useMemo(() => typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : null, []);
+    const appId = useMemo(() => typeof __app_id !== 'undefined' ? __app_id : 'default-app-id', []);
+
+    // --- Firebase Initialization and Auth Listener ---
+    useEffect(() => {
+        if (!firebaseConfig) {
+            setError("Firebase config is not available.");
+            setIsLoading(false);
+            return;
+        }
+
+        try {
+            const app = initializeApp(firebaseConfig);
+            const authInstance = getAuth(app);
+            const dbInstance = getFirestore(app);
+            setAuth(authInstance);
+            setDb(dbInstance);
+
+            const unsubscribe = onAuthStateChanged(authInstance, async (currentUser) => {
+                if (currentUser) {
+                    setUser(currentUser);
+                    // Listen directly to the user's own profile document
+                    const userDocRef = doc(dbInstance, `/artifacts/${appId}/public/data/users`, currentUser.uid);
+                    const unsubscribeUser = onSnapshot(userDocRef, (userDocSnap) => {
+                         if (userDocSnap.exists()) {
+                            // Profile exists, log them in
+                            const data = userDocSnap.data();
+                            setUserData(data);
+                            if(data.role === 'teacher') setCurrentView('teacherDashboard');
+                            if(data.role === 'student') setCurrentView('studentDashboard');
+                        } else {
+                            // No profile exists, show creation screen
+                            setUserData(null);
+                            setCurrentView('profileCreation');
+                        }
+                        setIsLoading(false);
+                    }, (err) => {
+                        console.error("Error in user snapshot listener:", err);
+                        setError("Could not fetch user profile.");
+                        setIsLoading(false);
+                    });
+                    return () => unsubscribeUser();
+                } else {
+                    // No user, sign in anonymously to get a stable UID
+                    setIsLoading(true);
+                    setUser(null);
+                    setUserData(null);
+                     if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
+                        await signInWithCustomToken(authInstance, __initial_auth_token).catch(err => console.error("Token sign in error:", err));
+                    } else {
+                        await signInAnonymously(authInstance).catch(err => console.error("Anonymous sign in error:", err));
+                    }
+                }
+            });
+            
+            return () => unsubscribe();
+
+        } catch (e) {
+            console.error("Firebase init error:", e);
+            setError("Could not connect to services. Please refresh.");
+            setIsLoading(false);
+        }
+    }, [firebaseConfig, appId]);
+
+    // --- Profile Creation ---
+    const handleCreateProfile = async (name, email, role) => {
+        if (!db || !user) {
+            setError("Not connected. Cannot create profile.");
+            return;
+        }
+        setIsLoading(true);
+        setError('');
+        try {
+            // Use the anonymous user's UID as the document ID
+            const userDocRef = doc(db, `/artifacts/${appId}/public/data/users`, user.uid);
+            const profile = {
+                name,
+                email, // Storing email for display, not for login
+                role,
+                userId: user.uid,
+                createdAt: serverTimestamp(),
+                ...(role === 'student' && {
+                    xp: 0,
+                    level: 1,
+                    paragraphsRead: 0,
+                    annotationsMade: 0,
+                    repliesMade: 0,
+                    worldConnections: 0,
+                    badges: []
+                })
+            };
+            await setDoc(userDocRef, profile);
+            // The onSnapshot listener will automatically pick this up and change the view
+        } catch (e) {
+            setError(e.message);
+            console.error("Profile Creation Error:", e);
+            setIsLoading(false);
+        }
+    };
+
+    const handleLogout = async () => {
+        if (!auth) return;
+        // The original user's data will remain, and a new anonymous user will be created.
+        // This is safer and avoids permission errors.
+        await signOut(auth);
+        setUser(null);
+        setUserData(null);
+        setCurrentView('profileCreation');
+        setCurrentClass(null);
+    };
+    
+    const navigate = (view, classData = null) => {
+        setCurrentView(view);
+        setCurrentClass(classData);
+    }
+
+    // --- Render Logic ---
+    const renderCurrentView = () => {
+        if (isLoading || currentView === 'loading') {
+            return <div className="flex items-center justify-center h-screen bg-gray-900 text-white"><div className="text-xl font-semibold">Loading...</div></div>;
+        }
+        if (error) {
+            return <div className="flex items-center justify-center h-screen bg-red-900 text-red-200"><div className="text-xl font-semibold">{error}</div></div>;
+        }
+
+        switch(currentView) {
+            case 'profileCreation':
+                return <ProfileCreationScreen onCreateProfile={handleCreateProfile} error={error} />;
+            case 'studentDashboard':
+                return <StudentDashboard />;
+            case 'teacherDashboard':
+                return <TeacherDashboard />;
+            case 'classRoster':
+                return <ClassRoster />;
+            case 'reader':
+                 return <ReaderView />;
+            default:
+                return <ProfileCreationScreen onCreateProfile={handleCreateProfile} error={error} />;
+        }
+    }
+    
+    const contextValue = {
+        auth, db, user, userData, appId, isLoading,
+        handleLogout, navigate, currentClass,
+        ...AppConfig
+    };
+
+    return (
+        <AppContext.Provider value={contextValue}>
+            <div className="min-h-screen bg-gray-900 text-gray-200 font-sans">
+                {renderCurrentView()}
+            </div>
+        </AppContext.Provider>
+    );
+}
+
+// --- Screens & Components ---
+
+function ProfileCreationScreen({ onCreateProfile, error }) {
+    const [email, setEmail] = useState('');
+    const [name, setName] = useState('');
+    const [role, setRole] = useState('student');
+
+    const handleSubmit = (e) => {
+        e.preventDefault();
+        onCreateProfile(name, email, role);
+    };
+
+    return (
+        <div className="flex items-center justify-center min-h-screen">
+            <div className="w-full max-w-md mx-auto bg-gray-800 p-8 rounded-lg shadow-2xl">
+                <h2 className="text-3xl font-bold text-center text-cyan-400 mb-2">Welcome to ReadingApp</h2>
+                <p className="text-center text-gray-400 mb-6">Create a profile to get started.</p>
+                {error && <p className="bg-red-500/20 text-red-300 p-3 rounded-md mb-4">{error}</p>}
+                <form onSubmit={handleSubmit} className="space-y-6">
+                    <div>
+                        <label className="block text-gray-400 text-sm font-bold mb-2" htmlFor="name">Full Name</label>
+                        <input type="text" id="name" value={name} onChange={(e) => setName(e.target.value)} className="w-full px-3 py-2 bg-gray-700 border border-gray-600 rounded-md focus:outline-none focus:ring-2 focus:ring-cyan-500 text-white" required />
+                    </div>
+                     <div>
+                        <label className="block text-gray-400 text-sm font-bold mb-2" htmlFor="email">Email</label>
+                        <input type="email" id="email" value={email} onChange={(e) => setEmail(e.target.value)} className="w-full px-3 py-2 bg-gray-700 border border-gray-600 rounded-md focus:outline-none focus:ring-2 focus:ring-cyan-500 text-white" required />
+                    </div>
+                    <div>
+                        <label className="block text-gray-400 text-sm font-bold mb-2">I am a...</label>
+                        <div className="flex justify-around gap-4">
+                            <label className={`cursor-pointer p-4 border-2 rounded-lg w-1/2 text-center transition-all ${role === 'teacher' ? 'border-cyan-500 bg-cyan-500/10' : 'border-gray-600'}`}>
+                                <input type="radio" name="role" value="teacher" checked={role === 'teacher'} onChange={() => setRole('teacher')} className="sr-only" />
+                                <span className="text-4xl">👩‍🏫</span>
+                                <p className="font-semibold mt-2">Teacher</p>
+                            </label>
+                            <label className={`cursor-pointer p-4 border-2 rounded-lg w-1/2 text-center transition-all ${role === 'student' ? 'border-cyan-500 bg-cyan-500/10' : 'border-gray-600'}`}>
+                                <input type="radio" name="role" value="student" checked={role === 'student'} onChange={() => setRole('student')} className="sr-only" />
+                                 <span className="text-4xl">🎓</span>
+                                <p className="font-semibold mt-2">Student</p>
+                            </label>
+                        </div>
+                    </div>
+                    <button type="submit" className="w-full bg-cyan-600 text-white py-2 rounded-md hover:bg-cyan-700 transition font-semibold shadow-lg shadow-cyan-600/20">Create Profile</button>
+                </form>
+            </div>
+        </div>
+    );
+}
+
+
+function TeacherDashboard() {
+    const { db, user, userData, appId, navigate, handleLogout } = useContext(AppContext);
+    const [classes, setClasses] = useState([]);
+    const [showModal, setShowModal] = useState(false);
+    const [newClassName, setNewClassName] = useState('');
+    const [copiedCode, setCopiedCode] = useState(null);
+
+    // Fetch teacher's classes in real-time
+    useEffect(() => {
+        if(!db || !user) return;
+        const q = query(collection(db, `/artifacts/${appId}/public/data/classes`), where("teacherId", "==", user.uid));
+        const unsubscribe = onSnapshot(q, (querySnapshot) => {
+            const classesData = [];
+            querySnapshot.forEach((doc) => {
+                classesData.push({ id: doc.id, ...doc.data() });
+            });
+            setClasses(classesData);
+        }, (err) => {
+            console.error("Error in teacher classes listener:", err);
+        });
+        return () => unsubscribe();
+    }, [db, user, appId]);
+
+    const handleCreateClass = async (e) => {
+        e.preventDefault();
+        if (!newClassName.trim() || !db || !user) return;
+
+        const generateClassCode = () => {
+            const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; // Unambiguous uppercase chars
+            let result = '';
+            for (let i = 0; i < 6; i++) {
+                result += chars.charAt(Math.floor(Math.random() * chars.length));
+            }
+            return result;
+        };
+        const classCode = generateClassCode();
+
+        // Create the main class document
+        const classRef = await addDoc(collection(db, `/artifacts/${appId}/public/data/classes`), {
+            className: newClassName,
+            teacherId: user.uid,
+            teacherName: userData?.name || 'Teacher',
+            classCode: classCode,
+            createdAt: serverTimestamp(),
+        });
+        
+        // Create the public lookup document for joining
+        const lookupRef = doc(db, `/artifacts/${appId}/public/data/classCodeDirectory`, classCode);
+        await setDoc(lookupRef, { classId: classRef.id });
+
+
+        setNewClassName('');
+        setShowModal(false);
+    };
+
+    const copyToClipboard = (text, id) => {
+        const textArea = document.createElement("textarea");
+        textArea.value = text;
+        textArea.style.top = "0";
+        textArea.style.left = "0";
+        textArea.style.position = "fixed";
+        document.body.appendChild(textArea);
+        textArea.focus();
+        textArea.select();
+        try {
+            const successful = document.execCommand('copy');
+            if (successful) {
+                setCopiedCode(id);
+                setTimeout(() => setCopiedCode(null), 2000);
+            }
+        } catch (err) {
+            console.error('Fallback: Oops, unable to copy', err);
+        }
+        document.body.removeChild(textArea);
+    };
+
+    return (
+        <div className="max-w-7xl mx-auto p-4 sm:p-6 lg:p-8">
+             <header className="flex justify-between items-center mb-10">
+                <h1 className="text-4xl font-bold text-cyan-400">Teacher Dashboard</h1>
+                <button onClick={handleLogout} className="px-4 py-2 bg-gray-700 text-white rounded-md hover:bg-gray-600 transition">Sign Out</button>
+            </header>
+
+            <div className="flex justify-between items-center mb-6">
+                <h2 className="text-3xl font-bold text-gray-300">My Classes</h2>
+                <button onClick={() => setShowModal(true)} className="flex items-center gap-2 px-4 py-2 bg-cyan-600 text-white rounded-md hover:bg-cyan-700 transition">
+                    Create Class
+                </button>
+            </div>
+            
+            {classes.length === 0 ? (
+                <p className="text-center text-gray-500 mt-10">You haven't created any classes yet. Click "Create Class" to get started.</p>
+            ) : (
+                <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
+                    {classes.map(c => (
+                        <div key={c.id} onClick={() => navigate('classRoster', c)} className="bg-gray-800 p-6 rounded-lg shadow-lg cursor-pointer hover:bg-gray-700/50 hover:border-cyan-500 border-2 border-transparent transition-all">
+                            <h3 className="text-xl font-bold text-cyan-400 mb-2">{c.className}</h3>
+                            <div className="mt-4">
+                                <label className="text-sm font-bold text-gray-400">CLASS CODE</label>
+                                <div className="flex items-center justify-between mt-1 bg-gray-900 p-2 rounded-md">
+                                    <span className="font-mono text-lg text-cyan-300">{c.classCode}</span>
+                                    <button onClick={(e) => { e.stopPropagation(); copyToClipboard(c.classCode, c.id); }} className="p-1 rounded-md hover:bg-gray-700">
+                                        {copiedCode === c.id ? 'Copied!' : 'Copy'}
+                                    </button>
+                                </div>
+                            </div>
+                        </div>
+                    ))}
+                </div>
+            )}
+
+            {showModal && (
+                <div className="fixed inset-0 bg-black bg-opacity-75 flex items-center justify-center z-50">
+                    <div className="bg-gray-800 p-8 rounded-lg shadow-xl w-full max-w-md">
+                        <h3 className="text-2xl font-bold mb-4 text-cyan-400">Create New Class</h3>
+                        <form onSubmit={handleCreateClass}>
+                            <input
+                                type="text"
+                                value={newClassName}
+                                onChange={(e) => setNewClassName(e.target.value)}
+                                placeholder="e.g., Period 3 English"
+                                className="w-full px-3 py-2 bg-gray-700 border border-gray-600 rounded-md focus:outline-none focus:ring-2 focus:ring-cyan-500 text-white mb-4"
+                            />
+                            <div className="flex justify-end gap-4">
+                                <button type="button" onClick={() => setShowModal(false)} className="px-4 py-2 bg-gray-600 rounded-md hover:bg-gray-500">Cancel</button>
+                                <button type="submit" className="px-4 py-2 bg-cyan-600 text-white rounded-md hover:bg-cyan-700">Create</button>
+                            </div>
+                        </form>
+                    </div>
+                </div>
+            )}
+        </div>
+    );
+}
+
+function StudentDashboard() {
+    const { db, user, userData, appId, navigate, handleLogout } = useContext(AppContext);
+    const [enrolledClasses, setEnrolledClasses] = useState([]);
+    const [showModal, setShowModal] = useState(false);
+    const [joinCode, setJoinCode] = useState('');
+    const [joinError, setJoinError] = useState('');
+
+    // Fetch student's enrollments and the class data
+    useEffect(() => {
+        if (!db || !user) return;
+        const enrollmentsQuery = query(collection(db, `/artifacts/${appId}/public/data/enrollments`), where("studentId", "==", user.uid));
+        
+        const unsubscribe = onSnapshot(enrollmentsQuery, async (snapshot) => {
+            const classIds = snapshot.docs.map(doc => doc.data().classId);
+            if (classIds.length > 0) {
+                const classesQuery = query(collection(db, `/artifacts/${appId}/public/data/classes`), where("__name__", "in", classIds));
+                const classesSnapshot = await getDocs(classesQuery);
+                const classesData = classesSnapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+                setEnrolledClasses(classesData);
+            } else {
+                setEnrolledClasses([]);
+            }
+        }, (err) => {
+            console.error("Error in student enrollments listener:", err);
+        });
+
+        return () => unsubscribe();
+    }, [db, user, appId]);
+
+    const handleJoinClass = async (e) => {
+        e.preventDefault();
+        setJoinError('');
+        const formattedCode = joinCode.trim().toUpperCase();
+
+        if (!formattedCode || !db || !user) {
+            setJoinError('Please enter a class code.');
+            return;
+        }
+
+        const lookupRef = doc(db, `/artifacts/${appId}/public/data/classCodeDirectory`, formattedCode);
+        const lookupSnap = await getDoc(lookupRef);
+
+        if (!lookupSnap.exists()) {
+            setJoinError('Invalid class code. Please check and try again.');
+            return;
+        }
+
+        const { classId } = lookupSnap.data();
+
+        const enrollmentsQuery = query(collection(db, `/artifacts/${appId}/public/data/enrollments`), 
+            where("studentId", "==", user.uid),
+            where("classId", "==", classId)
+        );
+        const enrollmentSnapshot = await getDocs(enrollmentsQuery);
+        if (!enrollmentSnapshot.empty) {
+            setJoinError('You are already enrolled in this class.');
+            setShowModal(false);
+            return;
+        }
+
+        await addDoc(collection(db, `/artifacts/${appId}/public/data/enrollments`), {
+            studentId: user.uid,
+            classId: classId,
+            enrolledAt: serverTimestamp(),
+        });
+
+        setJoinCode('');
+        setShowModal(false);
+    };
+
+    return (
+        <div className="max-w-7xl mx-auto p-4 sm:p-6 lg:p-8">
+            <header className="flex justify-between items-center mb-10">
+                <div>
+                    <h1 className="text-4xl font-bold text-cyan-400">Student Dashboard</h1>
+                    <p className="text-gray-400">Welcome, {userData?.name}!</p>
+                </div>
+                <button onClick={handleLogout} className="px-4 py-2 bg-gray-700 text-white rounded-md hover:bg-gray-600 transition">Sign Out</button>
+            </header>
+
+            <div className="flex justify-between items-center mb-6">
+                <h2 className="text-3xl font-bold text-gray-300">My Classes & Assignments</h2>
+                <button onClick={() => setShowModal(true)} className="flex items-center gap-2 px-4 py-2 bg-teal-600 text-white rounded-md hover:bg-teal-700 transition">
+                    Join a Class
+                </button>
+            </div>
+
+            {enrolledClasses.length === 0 ? (
+                <p className="text-center text-gray-500 mt-10">You are not enrolled in any classes. Click "Join a Class" and enter a code from your teacher.</p>
+            ) : (
+                <div className="space-y-6">
+                    {enrolledClasses.map(c => (
+                        <div key={c.id} className="bg-gray-800 p-6 rounded-lg shadow-lg">
+                            <div className="flex justify-between items-start">
+                                <div>
+                                    <h3 className="text-xl font-bold text-cyan-400 mb-1">{c.className}</h3>
+                                    <p className="text-sm text-gray-400">Taught by: {c.teacherName}</p>
+                                </div>
+                                <button onClick={() => navigate('reader', c)} className="px-6 py-2 bg-cyan-600 text-white rounded-md hover:bg-cyan-700 transition">
+                                    Start Reading
+                                </button>
+                            </div>
+                        </div>
+                    ))}
+                </div>
+            )}
+            
+            <GamificationProfile userProfile={userData} />
+
+            {showModal && (
+                 <div className="fixed inset-0 bg-black bg-opacity-75 flex items-center justify-center z-50">
+                    <div className="bg-gray-800 p-8 rounded-lg shadow-xl w-full max-w-md">
+                        <h3 className="text-2xl font-bold mb-4 text-cyan-400">Join a New Class</h3>
+                        {joinError && <p className="bg-red-500/20 text-red-300 p-3 rounded-md mb-4">{joinError}</p>}
+                        <form onSubmit={handleJoinClass}>
+                            <input
+                                type="text"
+                                value={joinCode}
+                                onChange={(e) => setJoinCode(e.target.value)}
+                                placeholder="Enter Class Code"
+                                className="w-full px-3 py-2 bg-gray-700 border border-gray-600 rounded-md focus:outline-none focus:ring-2 focus:ring-cyan-500 text-white mb-4 uppercase"
+                            />
+                            <div className="flex justify-end gap-4">
+                                <button type="button" onClick={() => setShowModal(false)} className="px-4 py-2 bg-gray-600 rounded-md hover:bg-gray-500">Cancel</button>
+                                <button type="submit" className="px-4 py-2 bg-teal-600 text-white rounded-md hover:bg-teal-700">Join</button>
+                            </div>
+                        </form>
+                    </div>
+                </div>
+            )}
+        </div>
+    );
+}
+
+function GamificationProfile({ userProfile }) {
+    const { LEVELS, BADGES } = useContext(AppContext);
+    if (!userProfile || typeof userProfile.xp === 'undefined') return null;
+
+    const currentLevel = userProfile.level || 1;
+    const currentLevelXP = LEVELS[currentLevel - 1];
+    const nextLevelXP = LEVELS[currentLevel] || currentLevelXP;
+    const xpIntoLevel = userProfile.xp - currentLevelXP;
+    const xpForLevel = nextLevelXP - currentLevelXP;
+    const xpPercentage = xpForLevel > 0 ? (xpIntoLevel / xpForLevel) * 100 : 100;
+
+    return (
+        <div className="mt-12 bg-gray-800 p-6 rounded-lg">
+            <h2 className="text-2xl font-bold text-cyan-400 mb-4">Your Progress</h2>
+            <div className="grid grid-cols-1 md:grid-cols-3 gap-8">
+                <div className="md:col-span-2">
+                    <h3 className="font-bold mb-2 text-gray-300">Level & XP</h3>
+                    <div className="flex justify-between items-baseline text-sm text-gray-400">
+                        <span>Level {currentLevel}</span>
+                        <span>{userProfile.xp} / {nextLevelXP} XP</span>
+                    </div>
+                    <div className="w-full bg-gray-700 rounded-full h-2.5 mt-1">
+                        <div className="bg-cyan-500 h-2.5 rounded-full" style={{ width: `${xpPercentage}%` }}></div>
+                    </div>
+                </div>
+                <div>
+                    <h3 className="font-bold mb-2 text-gray-300">Badges</h3>
+                    <div className="flex flex-wrap gap-4">
+                        {Object.keys(BADGES).map(badgeId => (
+                            <div key={badgeId} title={BADGES[badgeId].desc} className={`transition-opacity ${userProfile.badges?.includes(badgeId) ? 'opacity-100' : 'opacity-30'}`}>
+                                <span className="text-4xl">{BADGES[badgeId].icon}</span>
+                            </div>
+                        ))}
+                    </div>
+                </div>
+            </div>
+        </div>
+    );
+}
+
+function ClassRoster() {
+    const { db, appId, navigate, currentClass } = useContext(AppContext);
+    const [students, setStudents] = useState([]);
+
+    useEffect(() => {
+        if (!db || !currentClass) return;
+        
+        const enrollmentsQuery = query(collection(db, `/artifacts/${appId}/public/data/enrollments`), where("classId", "==", currentClass.id));
+        
+        const unsubscribe = onSnapshot(enrollmentsQuery, async (snapshot) => {
+            const studentIds = snapshot.docs.map(doc => doc.data().studentId);
+            
+            if (studentIds.length > 0) {
+                const usersQuery = query(collection(db, `/artifacts/${appId}/public/data/users`), where("userId", "in", studentIds));
+                const usersSnapshot = await getDocs(usersQuery);
+                const studentsData = usersSnapshot.docs.map(doc => doc.data());
+                setStudents(studentsData);
+            } else {
+                setStudents([]);
+            }
+        }, (err) => {
+            console.error("Error in class roster listener:", err);
+        });
+
+        return () => unsubscribe();
+    }, [db, appId, currentClass]);
+
+    return (
+        <div className="max-w-7xl mx-auto p-4 sm:p-6 lg:p-8">
+            <header className="flex justify-between items-center mb-10">
+                <div>
+                    <button onClick={() => navigate('teacherDashboard')} className="text-sm text-cyan-400 hover:underline mb-2">← Back to Dashboard</button>
+                    <h1 className="text-4xl font-bold text-cyan-400">{currentClass?.className} Roster</h1>
+                </div>
+                <button onClick={() => navigate('reader', currentClass)} className="px-6 py-2 bg-cyan-600 text-white rounded-md hover:bg-cyan-700 transition">
+                    View as Teacher
+                </button>
+            </header>
+            
+             <div className="bg-gray-800 p-6 rounded-lg shadow-lg">
+                <h2 className="text-2xl font-bold text-gray-300 mb-4">Enrolled Students ({students.length})</h2>
+                {students.length === 0 ? (
+                    <p className="text-gray-500">No students have joined this class yet.</p>
+                ) : (
+                    <div className="space-y-3">
+                        {students.map(student => (
+                            <div key={student.userId} className="flex items-center justify-between bg-gray-700 p-4 rounded-md">
+                                <div>
+                                    <p className="font-bold text-white">{student.name}</p>
+                                    <p className="text-sm text-gray-400">{student.email}</p>
+                                </div>
+                                <div className="text-right">
+                                    <p className="text-white">Level {student.level || 1}</p>
+                                    <p className="text-sm text-gray-400">{student.xp || 0} XP</p>
+                                </div>
+                            </div>
+                        ))}
+                    </div>
+                )}
+            </div>
+        </div>
+    );
+}
+
+
+function ReaderView() {
+    const { navigate, userData, currentClass, storyTitle, storyAuthor, storyText } = useContext(AppContext);
+    
+    const handleBack = () => {
+        if (userData?.role === 'teacher') {
+            navigate('classRoster', currentClass);
+        } else {
+            navigate('studentDashboard');
+        }
+    }
+
+    return (
+        <div className="max-w-4xl mx-auto p-4 sm:p-6 lg:p-8">
+             <header className="flex justify-between items-center mb-10">
+                <div>
+                    <button onClick={handleBack} className="text-sm text-cyan-400 hover:underline mb-2">
+                        {userData?.role === 'teacher' ? '← Back to Roster' : '← Back to Dashboard'}
+                    </button>
+                    <h1 className="text-4xl font-bold text-cyan-400">{storyTitle}</h1>
+                    <p className="text-gray-400">by {storyAuthor}</p>
+                </div>
+                 {userData?.role === 'teacher' && (
+                    <div className="bg-yellow-400/20 border border-yellow-500 text-yellow-300 px-4 py-2 rounded-md">
+                        Teacher View
+                    </div>
+                )}
+            </header>
+
+            <div className="prose prose-invert prose-lg max-w-none text-gray-300 leading-relaxed space-y-6">
+                {storyText.map((paragraph, index) => (
+                    <p key={index}>{paragraph}</p>
+                ))}
+            </div>
+        </div>
+    );
+}
